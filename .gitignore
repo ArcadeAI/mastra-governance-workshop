@@ -1,0 +1,10 @@
+node_modules/
+.venv/
+__pycache__/
+*.tsbuildinfo
+# The agent's own values and its kept sign-in. Never commit either.
+agent/.env
+agent/.tokens.json
+# Mastra's build output and the local trace store.
+agent/.mastra/
+mastra.db*

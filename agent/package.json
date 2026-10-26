@@ -1,0 +1,25 @@
+{
+  "name": "mastra-governance-workshop-agent",
+  "private": true,
+  "type": "module",
+  "description": "A Mastra agent that reaches its tools through your own Arcade MCP gateway, signed in as you.",
+  "scripts": {
+    "dev": "mastra dev",
+    "ask": "bun run ask.ts",
+    "tools": "bun run tools.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^1.69.0",
+    "@mastra/libsql": "^1.27.0",
+    "@mastra/mcp": "^2.0.0",
+    "@mastra/observability": "^1.21.0",
+    "ai": "^7.0.112",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "mastra": "^1.35.0",
+    "typescript": "^6.0.3"
+  }
+}
