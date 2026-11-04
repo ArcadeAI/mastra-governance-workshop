@@ -18,7 +18,7 @@ from loan_desk import app, approvals
 from loan_desk.approvals import Decision, decide, request_approval
 from tests import tools_of
 from loan_desk.approvals_message import format_amount
-from loan_desk.approvals_slack import lookup_user_by_email
+from loan_desk.approvals_slack import SlackError, lookup_user_by_email, post_message
 from loan_desk.approvals_store import base_url
 from tests.approvals.conftest import (
     CAST,
@@ -91,7 +91,7 @@ class TestDefinition:
             for t in CATALOG
         }
         assert secrets == {
-            "RequestApproval": ["APPROVALS_STORE_TOKEN", "APP_PUBLIC_HOST", "SLACK_APPROVALS_CHANNEL"],
+            "RequestApproval": ["APPROVALS_STORE_TOKEN", "APP_PUBLIC_HOST"],
             "Decide": ["APPROVALS_STORE_TOKEN", "APP_PUBLIC_HOST"],
         }
 
@@ -134,14 +134,14 @@ class TestDefinition:
 
 
 class TestTheChannelAnnouncement:
-    """`SLACK_APPROVALS_CHANNEL`: the room sees every request; nobody decides there."""
+    """The record's `slack_channel`: the room sees every request on every route; nobody decides there."""
 
     async def test_with_a_channel_configured_the_request_is_posted_there_too(
         self, store: StoreState, slack: SlackState
     ) -> None:
-        result = await request_approval(make_context(store.host, DANA.user_id, channel="C_LOAN_DESK"), **ACT_TWO)
-        assert [p["channel"] for p in slack.posted] == ["D_RILEY", "C_LOAN_DESK"]
-        announcement = slack.posted[1]
+        result = await request_approval(make_context(store.host, DANA.user_id), **ACT_TWO)
+        assert [p["channel"] for p in slack.posted] == ["#loan-desk"]
+        announcement = slack.posted[0]
         # Names the requester, the loan, the amount and the link; the approver is told who.
         assert DANA.display_name in announcement["text"]
         assert ACT_TWO["resource_id"] in announcement["text"]
@@ -150,25 +150,43 @@ class TestTheChannelAnnouncement:
         # And no buttons: the decision is made signed in, on the approval page.
         assert all(block["type"] != "actions" for block in announcement["blocks"])
         assert "button" not in json.dumps(announcement["blocks"])
-        assert result["slack_channel"] == "C_LOAN_DESK"
+        assert result["slack_channel"] == "#loan-desk"
         assert result["slack_channel_ts"]
 
-    async def test_without_a_channel_only_the_approver_is_messaged(
-        self, as_dana, store: StoreState, slack: SlackState
+    @pytest.mark.parametrize("route", ["email", "facilitator"])
+    async def test_an_email_or_facilitator_route_announces_but_sends_no_dm(
+        self, as_dana, store: StoreState, slack: SlackState, route: str
     ) -> None:
+        # The store sends the mail, or the queue is the dashboard; the room still sees it.
+        store.channel = route
         result = await request_approval(as_dana, **ACT_TWO)
-        assert [p["channel"] for p in slack.posted] == ["D_RILEY"]
-        assert "slack_channel" not in result
+        assert [p["channel"] for p in slack.posted] == ["#loan-desk"]
+        assert len(store.records) == 1
+        assert result["notice"] == route
+        assert result["slack_channel"] == "#loan-desk"
+        assert "slack_message_ts" not in result
+
+    @pytest.mark.parametrize("route", ["email", "facilitator"])
+    async def test_without_a_workshop_channel_those_routes_touch_slack_not_at_all(
+        self, as_dana, store: StoreState, slack: SlackState, route: str
+    ) -> None:
+        store.channel = route
+        store.slack_channel = None
+        result = await request_approval(as_dana, **ACT_TWO)
+        assert slack.posted == [] and slack.calls == []
+        assert len(store.records) == 1
+        assert result["notice"] == route
+        assert "slack_channel" not in result and "slack_message_ts" not in result
 
     async def test_a_channel_that_refuses_is_reported_and_the_request_still_stands(
         self, store: StoreState, slack: SlackState
     ) -> None:
-        # The DM went; the room's copy did not. Not an error for the caller:
-        # the approver has been told, and retrying would duplicate the request.
+        # The approvers' copy went (the store posted it); the room's copy did not. Not an
+        # error for the caller: the approvers have been told, and retrying would duplicate.
         slack.fail_with = "not_in_channel"
-        slack.fail_on = "chat.postMessage:2"
-        result = await request_approval(make_context(store.host, DANA.user_id, channel="C_LOAN_DESK"), **ACT_TWO)
-        assert result["slack_message_ts"]
+        slack.fail_on = "chat.postMessage:1"
+        result = await request_approval(make_context(store.host, DANA.user_id), **ACT_TWO)
+        assert result["notice"] == "slack" and result["approvers_post_ts"]
         assert result["slack_channel_error"] == "not_in_channel"
         assert len(store.records) == 1
 
@@ -277,21 +295,20 @@ class TestTheSlackMessage:
         assert request["content_type"] is None
         assert "token" not in request["query"].lower()
 
-    async def test_lookup_get_and_dm_posts_keep_method_payload_and_order(
+    async def test_the_one_post_keeps_method_and_payload(
         self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
         await request_approval(as_dana, **ACT_TWO)
 
+        # The room's copy only. No lookup and no DM since 2026-10-17, and since
+        # that night the approvers' copy is the store's post as the bot.
         assert [(request["method"], request["path"]) for request in slack.requests] == [
-            ("GET", "/api/users.lookupByEmail"),
-            ("POST", "/api/conversations.open"),
             ("POST", "/api/chat.postMessage"),
         ]
-        assert json.loads(slack.requests[1]["body"]) == {"users": "U_RILEY"}
-        assert json.loads(slack.requests[2]["body"]) == slack.posted[0]
+        assert json.loads(slack.requests[0]["body"]) == slack.posted[0]
         assert all(
             request["content_type"] == "application/json; charset=utf-8"
-            for request in slack.requests[1:]
+            for request in slack.requests
         )
         assert all(request["authorization"] == f"Bearer {SLACK_TOKEN}" for request in slack.requests)
 
@@ -300,52 +317,94 @@ class TestTheSlackMessage:
     ) -> None:
         await request_approval(as_dana, **ACT_TWO)
         # Every call carried Alice's user token. There is no bot token in this
-        # repo, and the DM renders under her name (spike #3).
+        # repo, and the post renders under her name (spike #3).
         assert set(slack.seen_tokens) == {SLACK_TOKEN}
 
     async def test_bob_requesting_for_charlie_uses_the_routed_email_and_bobs_token(
         self, store: StoreState, slack: SlackState
     ) -> None:
         # This mirrors the observed new-persona run locally: Bob is the
-        # requester, Charlie is the deterministic minimum-sufficient recipient,
-        # and Slack receives Bob's delegated user token.
+        # requester, Charlie is the deterministic minimum-sufficient recipient
+        # named in the post, and Slack receives Bob's delegated user token.
         bob_token = "xoxp-bob-token"
         await request_approval(
             make_context(store.host, SAM.user_id, slack_token=bob_token), **ACT_TWO
         )
 
-        assert slack.looked_up_emails == [RILEY.user_id]
+        assert RILEY.display_name in slack.posted[0]["text"]
+        assert slack.looked_up_emails == []
         assert set(slack.seen_tokens) == {bob_token}
 
-    async def test_direct_messages_the_routed_approver_and_nobody_else(
+    async def test_the_approvers_copy_is_the_stores_post_and_the_requester_never_posts_there(
+        self, as_dana, store: StoreState, slack: SlackState
+    ) -> None:
+        result = await request_approval(as_dana, **ACT_TWO)
+
+        # The requester's token never reaches the approvers' channel (she is not a
+        # member) and no DM is opened: the store posted there as the bot and said so.
+        assert not any(p["channel"].startswith("D_") for p in slack.posted)
+        assert all(p["channel"] != "#approvals" for p in slack.posted)
+        assert result["approvers_channel"] == "#approvals"
+        assert result["approvers_post_ts"] == "1700000000.000100"
+        assert result["notice"] == "slack"
+
+    async def test_the_approvals_channel_falls_back_to_approvals(
+        self, as_dana, store: StoreState, slack: SlackState
+    ) -> None:
+        # An older store that does not stamp the channel still names where the approvers sit.
+        store.approvals_channel = None
+        result = await request_approval(as_dana, **ACT_TWO)
+        assert result["approvers_channel"] == "#approvals"
+
+    async def test_only_chat_post_message_is_called(
         self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
         await request_approval(as_dana, **ACT_TWO)
+        assert slack.calls == ["chat.postMessage"]
 
-        assert len(slack.posted) == 1
-        # The `D…` channel conversations.open returned for Charlie, not a channel
-        # and not anyone else's DM.
-        assert slack.posted[0]["channel"] == "D_RILEY"
-
-    async def test_reaches_the_dm_by_the_route_spike_3_measured(
+    async def test_with_self_approval_on_the_requester_posts_both_copies_with_her_token(
         self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
-        # Resolve the email, open the DM, post to the channel that returns.
-        # Handing chat.postMessage a bare user id would skip the middle call
-        # and one scope, and nothing has observed that path work.
-        await request_approval(as_dana, **ACT_TWO)
-        assert slack.calls == [
-            "users.lookupByEmail",
-            "conversations.open",
-            "chat.postMessage",
-        ]
+        # The attendees sit in the approvers' channel, so the store leaves the
+        # approvers' copy to the requester's own tool: approvers' channel first,
+        # then the room, both with her delegated token, no bot and no DM.
+        store.self_approval = True
+        result = await request_approval(as_dana, **ACT_TWO)
+        assert [p["channel"] for p in slack.posted] == ["#approvals", "#loan-desk"]
+        assert set(slack.seen_tokens) == {SLACK_TOKEN}
+        assert RILEY.display_name in slack.posted[0]["text"]
+        assert any(block["type"] == "actions" for block in slack.posted[0]["blocks"])
+        assert all(block["type"] != "actions" for block in slack.posted[1]["blocks"])
+        assert result["approvers_channel"] == "#approvals" and result["approvers_post_ts"]
+        assert result["slack_channel_ts"]
 
-    async def test_a_dm_that_will_not_open_is_reported_and_nothing_is_posted(
+    async def test_with_self_approval_on_a_refused_approvers_post_is_an_error_and_nothing_else_is_posted(
         self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
-        slack.dms = {}
-        with pytest.raises(ToolExecutionError, match="user_not_found"):
+        store.self_approval = True
+        slack.fail_on = "chat.postMessage:1"
+        slack.fail_with = "not_in_channel"
+        with pytest.raises(ToolExecutionError, match="not_in_channel") as raised:
             await request_approval(as_dana, **ACT_TWO)
+        assert "Slack method chat.postMessage failed" in str(raised.value)
+        assert "Do not retry" in str(raised.value)
+        assert slack.posted == []
+        assert len(store.created) == 1
+
+    async def test_a_failed_approvers_post_is_an_error_and_nothing_else_is_posted(
+        self, as_dana, store: StoreState, slack: SlackState
+    ) -> None:
+        # The store recorded the request but its post to the approvers' channel failed:
+        # nobody has been told, so the agent must not read this as "requested".
+        store.approvers_post_error = "not_in_channel"
+        with pytest.raises(ToolExecutionError, match="not_in_channel") as raised:
+            await request_approval(as_dana, **ACT_TWO)
+        message = str(raised.value)
+        assert "recorded and routed" in message
+        assert "notice was not delivered" in message
+        assert "Do not retry" in message
+        assert RILEY.display_name in message
+        assert "#approvals" in message
         assert slack.posted == []
         assert len(store.created) == 1
 
@@ -356,7 +415,7 @@ class TestTheSlackMessage:
         posted = slack.posted[0]
 
         assert posted["blocks"], "blocks is what makes it Block Kit rather than text"
-        assert posted["text"], "without text the DM arrives as a silent, empty push"
+        assert posted["text"], "without text the post arrives as a silent, empty push"
         rendered = json.dumps(posted["blocks"])
         for expected in (
             DANA.display_name,          # requester
@@ -394,68 +453,37 @@ class TestTheSlackMessage:
         self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
         result = await request_approval(as_dana, **ACT_TWO)
-        button = next(
-            element
-            for block in slack.posted[0]["blocks"]
-            if block["type"] == "actions"
-            for element in block["elements"]
-        )
         # On the app's own host since #6: the store and the approval page are
-        # both the app, behind the one `APP_PUBLIC_HOST` secret. Until then
-        # the link had a host secret of its own, the web UI's.
-        assert button["url"] == f"{base_url(store.host)}/approvals/{result['request_id']}"
-        assert result["approval_url"] == button["url"]
+        # both the app, behind the one `APP_PUBLIC_HOST` secret. The room's copy
+        # carries it as a link in the text, never as a button.
+        assert result["approval_url"] == f"{base_url(store.host)}/approvals/{result['request_id']}"
+        assert result["approval_url"] in slack.posted[0]["text"]
+        assert all(block["type"] != "actions" for block in slack.posted[0]["blocks"])
 
     @pytest.mark.parametrize("smell", ["token", "signature", "sig=", "hmac", "jwt", "secret"])
     async def test_nothing_that_went_to_slack_carries_authority(
         self, as_dana, store: StoreState, slack: SlackState, smell: str
     ) -> None:
-        # The requester can read the DM she sent. Possession of this message is
+        # The requester can read the post she sent. Possession of this message is
         # not permission; authorization happens at click time, in #19.
         await request_approval(as_dana, **ACT_TWO)
         assert smell not in json.dumps(slack.posted[0]).lower()
 
-    @pytest.mark.parametrize(
-        ("failed_method", "calls_before_failure"),
-        [
-            ("users.lookupByEmail", ["users.lookupByEmail"]),
-            (
-                "conversations.open",
-                ["users.lookupByEmail", "conversations.open"],
-            ),
-            (
-                "chat.postMessage",
-                ["users.lookupByEmail", "conversations.open", "chat.postMessage"],
-            ),
-        ],
-    )
-    async def test_each_slack_failure_names_the_method_and_preserves_the_record(
-        self,
-        as_dana,
-        store: StoreState,
-        slack: SlackState,
-        failed_method: str,
-        calls_before_failure: list[str],
+    async def test_a_room_copy_that_fails_is_reported_and_the_request_stands(
+        self, as_dana, store: StoreState, slack: SlackState
     ) -> None:
-        slack.fail_on = failed_method
+        # The approvers have been told by the store; the room's copy is a courtesy.
+        # An agent told "failed" here would retry and create a second request.
+        slack.fail_on = "chat.postMessage"
         slack.fail_with = "invalid_arguments"
-        with pytest.raises(ToolExecutionError) as raised:
-            await request_approval(as_dana, **ACT_TWO)
-
-        message = str(raised.value)
-        assert f"Slack method {failed_method} failed" in message
-        assert "error code invalid_arguments" in message
-        assert "recorded and routed" in message
-        assert "notice was not delivered" in message
-        assert "Do not retry" in message
-        assert RILEY.display_name in message
-        # The record exists; what failed is the delivery. An agent told only
-        # "failed" would retry and create a second request.
+        result = await request_approval(as_dana, **ACT_TWO)
+        assert result["slack_channel_error"] == "invalid_arguments"
+        assert result["approvers_post_ts"]
         assert len(store.created) == 1
-        assert slack.calls == calls_before_failure
+        assert slack.calls == ["chat.postMessage"]
 
     async def test_slack_diagnostic_keeps_safe_detail_but_never_echoes_secrets_or_payload(
-        self, as_dana, store: StoreState, slack: SlackState
+        self, slack: SlackState
     ) -> None:
         slack.fail_on = "chat.postMessage"
         slack.fail_with = "invalid_arguments"
@@ -468,17 +496,13 @@ class TestTheSlackMessage:
             "request_body": ACT_TWO,
         }
 
-        with pytest.raises(ToolExecutionError) as raised:
-            await request_approval(as_dana, **ACT_TWO)
+        with pytest.raises(SlackError) as raised:
+            await post_message(SLACK_TOKEN, "#loan-desk", "approve_loan LN-2291", [])
 
-        diagnostic = raised.value.developer_message
+        diagnostic = raised.value.diagnostic_message()
         assert "detail=needed=chat:write; provided=users:read,users:read.email" in diagnostic
         for forbidden in (SLACK_TOKEN, "U_RILEY", "D_RILEY", "LN-2291", "approve_loan"):
             assert forbidden not in diagnostic
-        # The user-facing text contains only the method, code, safe request
-        # status, and recovery instruction; it never carries response detail.
-        for forbidden in (SLACK_TOKEN, "U_RILEY", "D_RILEY", "chat:write", "LN-2291"):
-            assert forbidden not in str(raised.value)
 
     async def test_a_slack_200_that_says_ok_false_is_a_failure_not_a_delivery(
         self, as_dana, store: StoreState, slack: SlackState
@@ -486,8 +510,9 @@ class TestTheSlackMessage:
         # The trap: Slack refuses with HTTP 200. A client reading the status
         # code would report a message that was never sent.
         slack.fail_with = "missing_scope"
-        with pytest.raises(ToolExecutionError, match="missing_scope"):
-            await request_approval(as_dana, **ACT_TWO)
+        result = await request_approval(as_dana, **ACT_TWO)
+        assert result["slack_channel_error"] == "missing_scope"
+        assert "slack_channel_ts" not in result
 
 
 class TestDecide:

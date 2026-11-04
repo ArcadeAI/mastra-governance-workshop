@@ -19,7 +19,7 @@ only checks status codes reads as success. It serves the three methods spike #3
 exercised — `users.lookupByEmail`, `conversations.open`, `chat.postMessage` —
 and nothing else, so a call the spike never measured fails here too.
 
-The roster comes from `gate/schema/contract/approver-routing-cases.json`,
+The roster comes from `approver-routing-cases.json` next to this file,
 the same file `test_routing.py` and the TypeScript router read, so the cast a
 tool test routes over cannot drift from the cast the routing rule is pinned
 against.
@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from arcade_core.schema import ToolAuthorizationContext, ToolContext, ToolSecretItem
 
-from loan_desk.approvals import APP_HOST_SECRET, APPROVALS_STORE_TOKEN_SECRET, SLACK_APPROVALS_CHANNEL_SECRET
+from loan_desk.approvals import APP_HOST_SECRET, APPROVALS_STORE_TOKEN_SECRET
 from tests.approvals.test_routing import CASES, SUBJECTS
 
 STORE_TOKEN = "store-token-for-tests"
@@ -62,6 +62,10 @@ CAST = [SUBJECTS[key] for key in CASES["cast"]]
 #: #19 that renders a blank.
 RECORD_FIELDS = (
     "id",
+    "channel",
+    "slack_channel",
+    "approvals_channel",
+    "approvers_post",
     "requester_id",
     "requester_display_name",
     "approver_id",
@@ -93,6 +97,18 @@ class StoreState:
     records: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Set to a status code to make the next call fail.
     fail_with: int | None = None
+    #: The requester's chosen approval route, stamped on every record by the
+    #: store: a `#channel` for Slack (approver's copy in the approvals channel), else email or instructor.
+    channel: str = "#loan-desk"
+    #: The requester's workshop channel, announced in on every route; None when they have none.
+    slack_channel: str | None = "#loan-desk"
+    #: Where the approvers sit; on the Slack route the store posts the approver's copy there as the bot.
+    approvals_channel: str | None = "#approvals"
+    #: What the store's own post to the approvers' channel answered: an error code makes the
+    #: record carry `approvers_post.error` instead of a `ts`, as the real store stamps it.
+    approvers_post_error: str | None = None
+    #: "Let attendees approve": the store stamps `by: requester` and the tool posts the approvers' copy itself.
+    self_approval: bool = False
     seq: int = 0
     #: Filled in by the fixture once the OS has picked a port.
     host: str = ""
@@ -175,11 +191,22 @@ class _StoreHandler(BaseHTTPRequestHandler):
                 "rule": self.state.rule,
                 "justification": body["justification"],
                 "status": "pending",
+                "channel": self.state.channel,
+                "slack_channel": self.state.slack_channel,
+                "approvals_channel": self.state.approvals_channel,
                 "created_at": "2026-09-09T12:00:00.000Z",
                 "decided_at": None,
                 "decided_by": None,
                 "note": None,
             }
+            if str(self.state.channel).startswith("#"):
+                target = self.state.approvals_channel or "#approvals"
+                if self.state.self_approval:
+                    record["approvers_post"] = {"channel": target, "by": "requester"}
+                elif self.state.approvers_post_error:
+                    record["approvers_post"] = {"channel": target, "error": self.state.approvers_post_error}
+                else:
+                    record["approvers_post"] = {"channel": target, "ts": "1700000000.000100"}
             self.state.records[record["id"]] = record
             self._send(201, {"request": record})
             return
@@ -277,8 +304,8 @@ class _SlackHandler(BaseHTTPRequestHandler):
     def _maybe_fail(self, method: str) -> bool:
         """Answer this call with `fail_with`, once, if it is the call `fail_on` names.
 
-        `fail_on` is a method, or `method:N` for its N-th call: the channel
-        announcement is the second `chat.postMessage` of a request, after the DM.
+        `fail_on` is a method, or `method:N` for its N-th call: since 2026-10-17
+        night the room's announcement is the only `chat.postMessage` of a request.
         """
         if self.state.fail_with is None:
             return False
@@ -397,20 +424,13 @@ def _as_dict(subject: Any) -> dict[str, Any]:
     }
 
 
-def make_context(
-    store_host: str, user_id: str, slack_token: str = SLACK_TOKEN, channel: str | None = None
-) -> ToolContext:
-    """What the Arcade engine hands a tool at runtime: a token, secrets, an identity.
-
-    `channel` is the `SLACK_APPROVALS_CHANNEL` secret; `None` leaves it unset,
-    which is how a project that never configured one looks to the tool.
-    """
+def make_context(store_host: str, user_id: str, slack_token: str = SLACK_TOKEN) -> ToolContext:
+    """What the Arcade engine hands a tool at runtime: a token, secrets, an identity."""
     return ToolContext(
         authorization=ToolAuthorizationContext(token=slack_token),
         secrets=[
             ToolSecretItem(key=APP_HOST_SECRET, value=store_host),
             ToolSecretItem(key=APPROVALS_STORE_TOKEN_SECRET, value=STORE_TOKEN),
-            *([] if channel is None else [ToolSecretItem(key=SLACK_APPROVALS_CHANNEL_SECRET, value=channel)]),
         ],
         user_id=user_id,
     )

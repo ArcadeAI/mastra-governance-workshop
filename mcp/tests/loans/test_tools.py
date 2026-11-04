@@ -4,7 +4,7 @@ import pytest
 from arcade_core.errors import ToolExecutionError
 
 from loan_desk import loans
-from loan_desk.loans import IDP_PROVIDER_ID, LoanStatus, approve_loan, deny_loan, get_loan, search_loans
+from loan_desk.loans import LoanStatus, approve_loan, deny_loan, get_loan, search_loans
 from tests import tools_of
 from tests.loans.conftest import DANA, RILEY
 
@@ -19,12 +19,12 @@ class TestDefinition:
         names = sorted(t.definition.name for t in CATALOG)
         assert names == ["ApproveLoan", "DenyLoan", "GetLoan", "SearchLoans"]
 
-    def test_every_tool_requires_the_idp_token_and_the_api_host(self) -> None:
+    def test_every_tool_requires_the_two_secrets_and_no_oauth(self) -> None:
+        # Since 2026-10-17: the gateway names the actor, the secrets name the project and the book.
         for tool in CATALOG:
-            auth = tool.definition.requirements.authorization
-            assert auth is not None and auth.id == IDP_PROVIDER_ID == "app-identity", tool.definition.name
+            assert tool.definition.requirements.authorization is None, tool.definition.name
             secrets = [s.key for s in tool.definition.requirements.secrets or []]
-            assert secrets == ["APP_PUBLIC_HOST"], tool.definition.name
+            assert secrets == ["APP_PUBLIC_HOST", "LOAN_SERVICE_TOKEN"], tool.definition.name
 
     def test_describes_every_tool_and_every_argument(self) -> None:
         for tool in CATALOG:
@@ -99,12 +99,12 @@ class TestGetLoan:
 
 
 class TestIdentity:
-    async def test_a_token_the_provider_rejects_fails_the_call(self, as_nobody) -> None:
-        with pytest.raises(ToolExecutionError, match="rejected"):
+    async def test_a_call_without_a_signed_in_user_fails(self, as_nobody) -> None:
+        with pytest.raises(ToolExecutionError, match="who is calling"):
             await search_loans(as_nobody)
 
     async def test_the_tool_has_no_way_to_say_who_is_acting(self) -> None:
-        # The actor is whoever holds the token. No tool takes one as an argument.
+        # The actor is whoever the gateway signed in. No tool takes one as an argument.
         for tool in CATALOG:
             names = {p.name for p in tool.definition.input.parameters}
             assert not names & {"actor", "user_id", "decided_by", "email"}, tool.definition.name
@@ -133,7 +133,8 @@ class TestDecisions:
             "decided_at": loan["decisions"][-1]["decided_at"],
         }
 
-    async def test_the_loan_book_is_the_only_state(self, as_riley) -> None:
+    async def test_the_loan_book_is_the_only_state(self, as_dana, as_riley) -> None:
+        await deny_loan(as_dana, loan_id="LN-2299", reason="Test decision persists across actors.")
         loan = await get_loan(as_riley, loan_id="LN-2299")
         assert loan["status"] == "denied"
 

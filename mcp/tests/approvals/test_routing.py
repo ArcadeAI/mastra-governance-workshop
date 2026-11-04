@@ -1,6 +1,6 @@
 """Routing, against the same rows the TypeScript router is checked against.
 
-`gate/schema/contract/approver-routing-cases.json` is the contract.
+`approver-routing-cases.json` next to this file (copied from deep-agents-governance's `gate/schema/contract/`) is the contract.
 `gate/engine/test/approver-router.test.ts` loads it too. Agreement
 between the two implementations is therefore tested, not argued: a row added
 there is checked here on the next run, and a row that stops matching one side
@@ -18,13 +18,8 @@ import pytest
 
 from loan_desk.approvals_routing import Subject, route_approval
 
-CASES_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "gate"
-    / "schema"
-    / "contract"
-    / "approver-routing-cases.json"
-)
+# Copied from deep-agents-governance's `gate/schema/contract/approver-routing-cases.json` (2026-10-16).
+CASES_PATH = Path(__file__).resolve().with_name("approver-routing-cases.json")
 
 CASES: dict[str, Any] = json.loads(CASES_PATH.read_text(encoding="utf-8"))
 

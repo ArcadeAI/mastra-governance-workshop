@@ -43,6 +43,10 @@ __all__ = [
 #: any consent screen (spike #3, transcript §8). `im:write` is what
 #: `conversations.open` needs, and opening the DM is how the spike reached the
 #: approver. Pinned in `.env.example` alongside this list.
+#: Since 2026-10-17 the approver's copy goes to the approvals channel rather than
+#: a DM, so `im:write` and the lookups are no longer exercised; the set stays as
+#: it is because changing it would send every attendee back through the Slack
+#: authorization in the middle of the workshop.
 SLACK_SCOPES = ["chat:write", "im:write", "users:read", "users:read.email"]
 
 _DEFAULT_API_BASE_URL = "https://slack.com/api"

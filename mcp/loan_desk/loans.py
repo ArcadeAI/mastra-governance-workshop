@@ -1,12 +1,17 @@
 """The loans toolkit: four tools, each a stateless client of the app's loan module.
 
-Nothing here holds state and nothing here decides anything. Every tool takes
-the caller's OAuth token, hands it to the loan desk's API, and returns what the API
-returns. The API derives who is acting from that token; the tools never say.
+Nothing here holds state and nothing here decides anything. Every tool names
+the caller to the loan desk's API and returns what the API returns. Who the
+caller is comes from the gateway: Arcade signed them in (the workshop identity
+provider through the user source, or their Arcade account) and hands the tool
+`context.user_id`. The tools carry no OAuth requirement of their own since
+2026-10-17: the per-attendee `LOAN_SERVICE_TOKEN` secret already proves which
+project is calling, and a second sign-in bound the server to an identity
+provider that goes away with the workshop.
 
 Whether a caller *may* do what they are asking is not this toolkit's question
 either — that is decided by the control plane's hooks, on a path these tools
-cannot see. The auth requirement on each tool carries identity, not authority.
+cannot see.
 
 The tool descriptions were written to be picked by a model without prompt
 coaching and reviewed on that basis. They came across from the previous MCP
@@ -19,13 +24,13 @@ from typing import Annotated, Any
 import httpx
 from arcade_core.errors import ToolExecutionError
 from arcade_mcp_server import Context
-from arcade_mcp_server.auth import OAuth2
 from arcade_mcp_server.metadata import Behavior, Operation, ToolMetadata
 
 __all__ = [
     "API_BASE_PATH",
+    "ACTOR_HEADER",
     "APP_HOST_SECRET",
-    "IDP_PROVIDER_ID",
+    "LOAN_BOOK_SECRET",
     "app",
     "approve_loan",
     "deny_loan",
@@ -42,16 +47,14 @@ __all__ = [
 # (measured in spike #2).
 from loan_desk.app import app
 
-# The Arcade auth provider id the app's identity module is registered under
-# (hop 2). Fixed, not configurable: `OAuth2(id=...)` is read at import, so the
-# README tells a developer to register the provider under exactly this id
-# (DESIGN.md → Toolkit configuration). It was `cg-idp`, the demo's service
-# name, until #6. Renaming it is this one line and the README's instruction.
-# The scopes are the least that make `/oauth2/userinfo` return an email, which
-# is how the API attributes the call. They are not a gate: a scope refusal
-# happens before any hook fires and would be invisible to the control plane.
-IDP_PROVIDER_ID = "app-identity"
-IDP_SCOPES = ["openid", "email"]
+# How the actor travels to the API. The gateway already knows who is calling
+# (`context.user_id`: the email the user source's `subject_claim` names, or the
+# Arcade account once the gateway is switched to project members), so the tool
+# forwards that and nothing else. Until 2026-10-17 each tool also required an
+# OAuth token from the `app-identity` provider and the API resolved the actor
+# at the provider's userinfo endpoint; that tied every attendee's server to the
+# workshop's Okta org, which is deprovisioned after the workshop.
+ACTOR_HEADER = "X-Actor"
 
 # HOST-form, like every service address in this repo (see `.env.example`).
 # Delivered to the deployed toolkit as an Arcade secret, because that is the
@@ -66,8 +69,15 @@ APP_HOST_SECRET = "APP_PUBLIC_HOST"
 # and POST /bank/loans/{id}/deny. The secret still names the host alone.
 API_BASE_PATH = "/bank"
 
-_requires_auth = OAuth2(id=IDP_PROVIDER_ID, scopes=IDP_SCOPES)
-_requires_secrets = [APP_HOST_SECRET]
+# Which loan book. The workshop loan service keeps one book per attendee and
+# picks it by this token, sent as `X-Loan-Book`. The portal mints the token
+# when the attendee connects their project and uploads it as a project
+# secret; the same value is the bearer the approvals store wants, so it is
+# uploaded under `APPROVALS_STORE_TOKEN` too. The book is chosen by the
+# secret, the actor by the gateway (`X-Actor`).
+LOAN_BOOK_SECRET = "LOAN_SERVICE_TOKEN"
+
+_requires_secrets = [APP_HOST_SECRET, LOAN_BOOK_SECRET]
 
 # The previous MCP surface carried `readOnlyHint`, `destructiveHint`,
 # `idempotentHint` and `openWorldHint` on each tool. `arcade-mcp`'s
@@ -112,9 +122,18 @@ async def _call(
     params: dict[str, Any] | None = None,
     json: dict[str, Any] | None = None,
 ) -> Any:
-    """One request to the API, on behalf of whoever holds the token."""
+    """One request to the API, on behalf of whoever the gateway signed in."""
+    actor = (context.user_id or "").strip()
+    if not actor:
+        raise ToolExecutionError(
+            "The gateway did not say who is calling.",
+            developer_message="context.user_id was empty; the gateway must bind a user source or sign the caller in.",
+        )
     url = _base_url(context.get_secret(APP_HOST_SECRET)) + API_BASE_PATH + path
-    headers = {"Authorization": f"Bearer {context.get_auth_token_or_empty()}"}
+    headers = {
+        ACTOR_HEADER: actor,
+        "X-Loan-Book": context.get_secret(LOAN_BOOK_SECRET),
+    }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -143,7 +162,7 @@ LoanId = Annotated[
 ]
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_read)
+@app.tool(requires_secrets=_requires_secrets, metadata=_read)
 async def search_loans(
     context: Context,
     status: Annotated[
@@ -169,7 +188,7 @@ async def search_loans(
     return await _call(context, "GET", "/loans", params=params)
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_read)
+@app.tool(requires_secrets=_requires_secrets, metadata=_read)
 async def get_loan(
     context: Context,
     loan_id: LoanId,
@@ -178,7 +197,7 @@ async def get_loan(
     return await _call(context, "GET", f"/loans/{loan_id}")
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_write)
+@app.tool(requires_secrets=_requires_secrets, metadata=_write)
 async def approve_loan(
     context: Context,
     loan_id: LoanId,
@@ -192,7 +211,7 @@ async def approve_loan(
     return await _call(context, "POST", f"/loans/{loan_id}/approve", json={"amount": amount})
 
 
-@app.tool(requires_auth=_requires_auth, requires_secrets=_requires_secrets, metadata=_write)
+@app.tool(requires_secrets=_requires_secrets, metadata=_write)
 async def deny_loan(
     context: Context,
     loan_id: LoanId,

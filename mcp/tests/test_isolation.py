@@ -61,23 +61,27 @@ class TestNothingReachesIn:
         assert offenders == [], offenders
 
     def test_it_is_not_a_bun_workspace(self) -> None:
-        # Deleting a workspace member breaks `bun install`. This is not one.
-        manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
-        assert not any("mcp" in pattern for pattern in manifest["workspaces"])
+        # Deleting a workspace member breaks `bun install`. This is not one. A repo
+        # with no root manifest (this one: the agent has its own) has no workspaces.
+        root = REPO_ROOT / "package.json"
+        if not root.exists():
+            return
+        manifest = json.loads(root.read_text(encoding="utf-8"))
+        assert not any("mcp" in pattern for pattern in manifest.get("workspaces", []))
 
-    def test_it_is_not_in_the_app_image(self) -> None:
-        # It ships with `arcade deploy`, not in the app's container; an image
-        # that copied it would make deleting the directory a failed build.
-        ignored = [
-            line.strip()
-            for line in (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+    def test_it_is_not_in_any_container_image(self) -> None:
+        # It ships with `arcade deploy`, never inside another service's image; an
+        # image that copied it would make deleting the directory a failed build.
+        dockerfiles = [
+            path
+            for path in REPO_ROOT.rglob("Dockerfile*")
+            if not any(part in (".venv", "node_modules", ".git") for part in path.parts)
         ]
-        assert "mcp" in ignored, ignored
         copies = [
-            line
-            for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
-            if re.match(r"\s*(COPY|ADD)\b", line, re.IGNORECASE) and "mcp" in line
+            f"{path.relative_to(REPO_ROOT)}: {line.strip()}"
+            for path in dockerfiles
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if re.match(r"\s*(COPY|ADD)\b", line, re.IGNORECASE) and re.search(r"\bmcp\b", line)
         ]
         assert copies == [], copies
 
