@@ -1,0 +1,189 @@
+{
+  "$schema_note": "Hand-written. Not generated, not vendored — see contract/README.md.",
+  "description": "Cross-language test vectors for minimum-sufficient-clearance approver routing (#9). The roles below are deliberately neutral: this contract is shared by the reusable TypeScript and Python routers and must not encode one application's domain. Consumed by gate/engine/test/approver-router.test.ts and by mcp/tests/approvals/test_routing.py, so the two implementations are checked against the same rows rather than argued to agree.",
+  "rule": [
+    "1. Drop the requester, always, even when their own clearance would cover the amount.",
+    "2. Drop everyone whose clearance is below the amount. Clearance is a ceiling, so clearance == amount is sufficient.",
+    "3. Of those left, pick the lowest clearance.",
+    "4. Tie-break equal clearances by user_id ascending, compared as raw strings — never locale-aware. JavaScript orders by UTF-16 code unit and Python by code point; they agree across the Basic Multilingual Plane, which covers every address either roster will ever hold.",
+    "Having nobody eligible is an ordinary outcome, not an error. A non-finite or negative amount is a programming error and must raise."
+  ],
+  "subjects": {
+    "dana": { "user_id": "alice@example.com", "display_name": "Alice", "role": "operator", "clearance": 50000 },
+    "sam": { "user_id": "bob@example.com", "display_name": "Bob", "role": "analyst", "clearance": 0 },
+    "riley": { "user_id": "charlie@example.com", "display_name": "Charlie", "role": "supervisor", "clearance": 250000 },
+    "morgan": { "user_id": "michael@example.com", "display_name": "Michael", "role": "executive", "clearance": 5000000 },
+    "upper": { "user_id": "Zed@example.com", "display_name": "Zed", "role": "supervisor", "clearance": 100 },
+    "lower": { "user_id": "abe@example.com", "display_name": "Abe", "role": "supervisor", "clearance": 100 },
+    "middle": { "user_id": "bea@example.com", "display_name": "Bea", "role": "supervisor", "clearance": 100 }
+  },
+  "cast": ["morgan", "dana", "sam", "riley"],
+  "cases": [
+    {
+      "name": "the headline case: $95K from Alice goes to Charlie, not Michael",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "exact boundary: an amount equal to a clearance is covered by it",
+      "amount": 250000,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "exact boundary + 1: one over Charlie's ceiling escalates to Michael",
+      "amount": 250001,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "michael@example.com",
+      "candidates": ["michael@example.com"]
+    },
+    {
+      "name": "exact boundary at the top: Michael's own ceiling still resolves",
+      "amount": 5000000,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "michael@example.com",
+      "candidates": ["michael@example.com"]
+    },
+    {
+      "name": "requester excluded despite sufficient authority: Charlie asking for $95K",
+      "amount": 95000,
+      "requester": "charlie@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "michael@example.com",
+      "candidates": ["michael@example.com"]
+    },
+    {
+      "name": "requester excluded despite sufficient authority: Alice asking for $10K goes to Charlie",
+      "amount": 10000,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "requester excluded even at the top: Michael asking for $1M has nobody",
+      "amount": 1000000,
+      "requester": "michael@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": null,
+      "candidates": []
+    },
+    {
+      "name": "no eligible approver: the amount exceeds every clearance",
+      "amount": 5000001,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": null,
+      "candidates": []
+    },
+    {
+      "name": "several eligible resolve to the lowest, not the first in roster order",
+      "amount": 1000,
+      "requester": "bob@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "alice@example.com",
+      "candidates": ["alice@example.com", "charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "single-person roster, that person is sufficient and not the requester",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": ["riley"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com"]
+    },
+    {
+      "name": "single-person roster, that person is the requester",
+      "amount": 1000,
+      "requester": "charlie@example.com",
+      "roster": ["riley"],
+      "approver": null,
+      "candidates": []
+    },
+    {
+      "name": "single-person roster, that person is insufficient",
+      "amount": 95000,
+      "requester": "charlie@example.com",
+      "roster": ["dana"],
+      "approver": null,
+      "candidates": []
+    },
+    {
+      "name": "empty roster",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": [],
+      "approver": null,
+      "candidates": []
+    },
+    {
+      "name": "requester not on the roster at all is still routed normally",
+      "amount": 95000,
+      "requester": "stranger@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "zero clearance covers a zero amount (pure inequality, no special case)",
+      "amount": 0,
+      "requester": "alice@example.com",
+      "roster": ["morgan", "dana", "sam", "riley"],
+      "approver": "bob@example.com",
+      "candidates": ["bob@example.com", "charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "equal clearances resolve to the lexicographically smallest user_id",
+      "amount": 50,
+      "requester": "nobody@example.com",
+      "roster": ["middle", "upper", "lower"],
+      "approver": "Zed@example.com",
+      "candidates": ["Zed@example.com", "abe@example.com", "bea@example.com"]
+    },
+    {
+      "name": "ids compare by code unit, not by locale: uppercase sorts before lowercase",
+      "amount": 50,
+      "requester": "nobody@example.com",
+      "roster": ["lower", "upper"],
+      "approver": "Zed@example.com",
+      "candidates": ["Zed@example.com", "abe@example.com"]
+    },
+    {
+      "name": "roster order is irrelevant: the same cast permuted lands on Charlie",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": ["riley", "morgan", "dana", "sam"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "roster order is irrelevant, another permutation",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": ["sam", "riley", "morgan", "dana"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    },
+    {
+      "name": "roster order is irrelevant, a third permutation",
+      "amount": 95000,
+      "requester": "alice@example.com",
+      "roster": ["dana", "sam", "riley", "morgan"],
+      "approver": "charlie@example.com",
+      "candidates": ["charlie@example.com", "michael@example.com"]
+    }
+  ],
+  "invalid_amounts": [
+    { "name": "a negative amount", "amount": -1 },
+    { "name": "NaN", "amount": "NaN" },
+    { "name": "positive infinity", "amount": "Infinity" },
+    { "name": "negative infinity", "amount": "-Infinity" }
+  ]
+}

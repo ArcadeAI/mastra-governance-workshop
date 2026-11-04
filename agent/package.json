@@ -2,19 +2,24 @@
   "name": "mastra-governance-workshop-agent",
   "private": true,
   "type": "module",
-  "description": "A Mastra agent that reaches its tools through your own Arcade MCP gateway, signed in as you.",
+  "description": "A Mastra agent that finds its tools with Arcade's Tool Rec and calls them through Arcade, governed by your policy and checked by Jev.",
   "scripts": {
     "dev": "mastra dev",
+    "signin": "bun run signin.ts",
     "ask": "bun run ask.ts",
     "tools": "bun run tools.ts",
-    "typecheck": "tsc --noEmit"
+    "jev": "bun run jev.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun --no-env-file test"
   },
   "dependencies": {
+    "@ai-sdk/typesafe-ai": "3.0.33",
+    "@arcadeai/arcadejs": "2.4.1",
     "@mastra/core": "^1.69.0",
     "@mastra/libsql": "^1.27.0",
-    "@mastra/mcp": "^2.0.0",
     "@mastra/observability": "^1.21.0",
     "ai": "^7.0.112",
+    "jose": "6.2.13",
     "zod": "4.6.5"
   },
   "devDependencies": {

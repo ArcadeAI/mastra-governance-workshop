@@ -13,6 +13,7 @@ dev = [
     "arcade-mcp[all]>=1.15.0,<2.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
+    "asyncpg>=0.30.0",
 ]
 
 # Tells Arcade this package carries Arcade tools.

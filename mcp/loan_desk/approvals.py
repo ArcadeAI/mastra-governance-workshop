@@ -24,7 +24,15 @@ enforced in #19.
 
 **It does not hand out authority.** The link in the Slack message is a pointer
 to a request id: no token, no signature, no capability. The requester can read
-the DM she sent, so possession of the URL must not be permission.
+the post she sent, so possession of the URL must not be permission.
+
+**It does not reach the approvers itself.** Since 2026-10-17 night the store
+posts the approver's copy to the approvers' channel as the workshop bot when it
+records a Slack-routed request, and stamps the outcome on the record as
+`approvers_post`; the requester is not a member of that channel, so a post with
+her own token answered `not_in_channel`. The tool posts the room's copy, in the
+requester's own workshop channel, with her token, and the approvers' copy too
+only when the store says the attendees approve (`by: requester`).
 
 `MCPApp(name="approvals")` below is what `arcade deploy` reads off `initialize`
 and PascalCases into the toolkit name, so these are `LoanDesk.RequestApproval`
@@ -53,8 +61,6 @@ from loan_desk.approvals_routing import RoutingResult, Subject, route_approval
 from loan_desk.approvals_slack import (
     SLACK_SCOPES,
     SlackError,
-    lookup_user_by_email,
-    open_direct_message,
     post_message,
 )
 from loan_desk.approvals_store import (
@@ -98,16 +104,23 @@ _requires_slack = Slack(scopes=SLACK_SCOPES)
 # approval page both live, and the store's bearer.
 _secrets = [APP_HOST_SECRET, APPROVALS_STORE_TOKEN_SECRET]
 
-#: The Slack channel every approval request is also posted to, so the room sees
-#: it (`SLACK_APPROVALS_CHANNEL` in `.env`; `setup-arcade` uploads it as a tool
-#: secret when it is set). The DM to the approver is the notice; this is the
-#: announcement. Blank or absent: no channel post, and nothing else changes.
-#: The approver still decides on the signed-in approval page: the post carries
-#: the link and no buttons, because a button would make a Slack identity an
-#: authority, and authority here is the IdP sign-in.
-SLACK_APPROVALS_CHANNEL_SECRET = "SLACK_APPROVALS_CHANNEL"
-
-_request_secrets = [*_secrets, SLACK_APPROVALS_CHANNEL_SECRET]
+#: The Slack channels an approval request reaches. The approvals store stamps
+#: each request with the requester's chosen route (`channel` on the record: a
+#: `#channel` for Slack, otherwise `email` or `facilitator`), their workshop
+#: channel (`slack_channel`) and the approvers' channel (`approvals_channel`,
+#: `#approvals` unless the store says otherwise), so the tool needs no secret
+#: for any of them. On the Slack route the store itself posts the approver's
+#: copy to the approvers' channel as the workshop bot and stamps the outcome as
+#: `approvers_post` (until 2026-10-17 night the tool posted it as the requester,
+#: and before that it was a DM); with "Let attendees approve" on the attendees
+#: sit in that channel, the stamp says `by: requester`, and the tool posts it
+#: with her token after all. Otherwise the store has sent the mail, or the
+#: queue is the dashboard. The workshop channel gets the room's copy on every
+#: route, posted here as the requester. The approver still decides on the
+#: signed-in approval page: nothing in Slack is an authority, and authority here
+#: is the IdP sign-in.
+_request_secrets = _secrets
+_DEFAULT_APPROVALS_CHANNEL = "#approvals"
 
 
 class Decision(str, Enum):
@@ -252,52 +265,11 @@ async def request_approval(
         ),
     )
 
-    slack_token = context.get_auth_token_or_empty()
-    try:
-        # The three calls spike #3 exercised, in that order: resolve the
-        # approver's email to a Slack id, open the DM, post to the channel that
-        # returns. Handing chat.postMessage a bare user id would skip the
-        # middle call and one scope, but nothing has observed that path work.
-        approver_slack_id = await lookup_user_by_email(slack_token, approver.user_id)
-        dm_channel = await open_direct_message(slack_token, approver_slack_id)
-        posted = await post_message(
-            slack_token,
-            dm_channel,
-            build_fallback_text(message),
-            build_blocks(message),
-        )
-    except SlackError as exc:
-        # The record exists and the routing stands; what failed is the notice.
-        # Saying so precisely is the difference between "go and tell Charlie" and
-        # an agent that believes it has escalated something nobody has seen.
-        raise ToolExecutionError(
-            f"Approval request {request_id} was recorded and routed to "
-            f"{approver.display_name or 'the routed approver'}, but Slack method "
-            f"{exc.method} failed with error code {exc.error}; the notice was not "
-            "delivered. Do not retry this approval request: retrying would create a "
-            "duplicate. Stop and capture the method and error code for an administrator.",
-            developer_message=(
-                f"{exc.diagnostic_message()}; approval request {request_id} was "
-                "recorded and routed, but notice delivery failed; do not retry."
-            ),
-        ) from exc
-
-    # The room's copy, after the approver's own. Posted as the requester, with
-    # her token, so it needs no bot and no extra scope; a channel she is not in
-    # refuses with `not_in_channel`, which is reported, not raised: the request
-    # is recorded and the approver has been told, and that is the notice.
-    channel = _approvals_channel(context)
-    announcement: dict[str, str] = {}
-    if channel:
-        try:
-            announced = await post_message(
-                slack_token, channel, build_channel_text(message), build_channel_blocks(message)
-            )
-            announcement = {"slack_channel": channel, "slack_channel_ts": announced["ts"]}
-        except SlackError as exc:
-            announcement = {"slack_channel": channel, "slack_channel_error": exc.error}
-
-    return {
+    route = str(record.get("channel") or "facilitator")
+    dm_route = route.startswith("#")
+    channel = _workshop_channel(record)
+    approvers_channel = _approvers_channel(record)
+    base = {
         "request_id": str(request_id),
         "status": str(record.get("status", "pending")),
         "approver": approver.user_id,
@@ -305,17 +277,89 @@ async def request_approval(
         "required_clearance": routed.required_clearance,
         "candidate_approvers": [s.user_id for s in routed.candidates],
         "approval_url": message.approval_url,
-        "slack_message_ts": posted["ts"],
-        **announcement,
+        "notice": "slack" if dm_route else route,
     }
+    if not dm_route and not channel:
+        # Email or the instructor queue, and no workshop channel to announce in:
+        # the store has sent the notice (the mail) or the queue is the dashboard.
+        return base
+
+    slack_token = context.get_auth_token_or_empty()
+    if dm_route:
+        # The approvers' copy is normally the store's: posted as the workshop bot
+        # when the request was recorded, outcome on the record. With "Let
+        # attendees approve" on, the attendees sit in that channel and the store
+        # stamps `by: requester`: then it is posted here, with her token, like
+        # the room's copy. Either way a failure is the one thing the agent must
+        # not read as "requested": the record exists and the routing stands,
+        # but nobody has been told.
+        post = record.get("approvers_post") if isinstance(record.get("approvers_post"), dict) else {}
+        target = str(post.get("channel") or approvers_channel)
+        # The approvers' channel is private (since 2026-10-17 evening), and Slack takes a private
+        # channel's id, not its name: the store stamps the id next to the name when it knows it.
+        post_to = str(post.get("id") or target)
+        failure = str(post.get("error") or "")
+        if post.get("by") == "requester":
+            try:
+                posted = await post_message(
+                    slack_token, post_to, build_fallback_text(message), build_blocks(message)
+                )
+            except SlackError as exc:
+                raise ToolExecutionError(
+                    f"Approval request {request_id} was recorded and routed to "
+                    f"{approver.display_name or 'the routed approver'}, but Slack method "
+                    f"{exc.method} failed with error code {exc.error}; the notice was not "
+                    "delivered. Do not retry this approval request: retrying would create a "
+                    "duplicate. Stop and capture the method and error code for an administrator.",
+                    developer_message=(
+                        f"{exc.diagnostic_message()}; approval request {request_id} was "
+                        "recorded and routed, but notice delivery failed; do not retry."
+                    ),
+                ) from exc
+            base["approvers_channel"] = target
+            base["approvers_post_ts"] = posted["ts"]
+        elif failure:
+            raise ToolExecutionError(
+                f"Approval request {request_id} was recorded and routed to "
+                f"{approver.display_name or 'the routed approver'}, but the notice to "
+                f"{target} failed with error code {failure}; "
+                "the notice was not delivered. Do not retry this approval request: retrying "
+                "would create a duplicate. Stop and capture the error code for an administrator.",
+                developer_message=(
+                    f"approvers_post failed with {failure}; approval request {request_id} was "
+                    "recorded and routed, but notice delivery failed; do not retry."
+                ),
+            )
+        else:
+            base["approvers_channel"] = target
+            if post.get("ts"):
+                base["approvers_post_ts"] = str(post["ts"])
+
+    # The room's copy, on every route. Posted as the requester, with her token,
+    # in her own workshop channel, so it needs no bot and no extra scope; a
+    # refusal is reported, not raised: the request is recorded and the approvers
+    # have been told, and that is the notice.
+    if channel:
+        try:
+            announced = await post_message(
+                slack_token, channel, build_channel_text(message), build_channel_blocks(message)
+            )
+            base.update({"slack_channel": channel, "slack_channel_ts": announced["ts"]})
+        except SlackError as exc:
+            base.update({"slack_channel": channel, "slack_channel_error": exc.error})
+    return base
 
 
-def _approvals_channel(context: Context) -> str:
-    """The channel to announce in, or empty when none is configured."""
-    try:
-        return context.get_secret(SLACK_APPROVALS_CHANNEL_SECRET).strip()
-    except ValueError:
-        return ""
+def _workshop_channel(record: dict[str, Any]) -> str:
+    """The requester's workshop channel to announce in, or empty when they have none."""
+    channel = str(record.get("slack_channel") or "").strip()
+    return channel if channel.startswith("#") else ""
+
+
+def _approvers_channel(record: dict[str, Any]) -> str:
+    """The channel the approvers sit in, as the store stamps it; `#approvals` when it does not."""
+    channel = str(record.get("approvals_channel") or "").strip()
+    return channel if channel.startswith("#") else _DEFAULT_APPROVALS_CHANNEL
 
 
 @app.tool(requires_secrets=_secrets)

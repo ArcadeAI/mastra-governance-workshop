@@ -1,38 +1,34 @@
-"""Boots the real loan module and a stand-in identity provider.
+"""Boots the real workshop loan service.
 
 The four tools are stateless clients, so the only honest test drives them
-through the real API: `bun scripts/loans.ts`, the app's loan module on a port
-of its own and laid out under `/bank` exactly as the app serves it (#5), with a
-fresh `loans.db` in a temp directory. Tokens are validated against a tiny
-fake issuer shaped like Okta's: a discovery document, and the userinfo
-endpoint it names answering for two known bearer tokens. Userinfo is the one
-identity endpoint the API ever calls, and it finds it through discovery.
+through the real API: `service/` (uvicorn) on a port of its own, against the
+database `TEST_DATABASE_URL` names (the portal's tables must exist there), with
+a throwaway attendee whose loan book the tools reach by its token. The actor is
+whoever the context says the gateway signed in (`user_id`); since 2026-10-17 no
+identity provider is involved. Without `TEST_DATABASE_URL` these tests skip.
 """
 
-import json
+import asyncio
 import os
-import shutil
 import signal
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import uuid
 from pathlib import Path
 
 import pytest
-from arcade_core.schema import ToolAuthorizationContext, ToolContext, ToolSecretItem
+from arcade_core.schema import ToolContext, ToolSecretItem
 
-from loan_desk.loans import APP_HOST_SECRET
+from loan_desk.loans import APP_HOST_SECRET, LOAN_BOOK_SECRET
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LOAN_APP_ENTRYPOINT = REPO_ROOT / "scripts" / "loans.ts"
+SERVICE_DIR = Path(os.environ.get("TEST_LOAN_SERVICE_DIR", REPO_ROOT.parent / "workshop-portal" / "service")).expanduser().resolve()
 
 DANA = "alice@example.test"
 RILEY = "charlie@example.test"
-TOKENS = {"tok-dana": DANA, "tok-riley": RILEY}
 
 
 def _free_port() -> int:
@@ -91,77 +87,62 @@ def _stop(child: subprocess.Popen) -> None:
     child.wait()
 
 
-class _Userinfo(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
-        issuer = f"http://127.0.0.1:{self.server.server_port}/oauth2/default"
-        if self.path == "/oauth2/default/.well-known/openid-configuration":
-            body = json.dumps({"issuer": issuer, "userinfo_endpoint": f"{issuer}/v1/userinfo"}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        token = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-        email = TOKENS.get(token)
-        if self.path != "/oauth2/default/v1/userinfo" or email is None:
-            self.send_response(401)
-            self.end_headers()
-            return
-        body = json.dumps({"sub": email, "email": email, "email_verified": True}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(body)
+@pytest.fixture(scope="session")
+def database_url() -> str:
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL is not set; the toolkit tests drive the real loan service")
+    return url
 
-    def log_message(self, *_: object) -> None:
-        pass
+
+@pytest.fixture
+def loan_book(database_url: str) -> dict[str, str]:
+    """A throwaway attendee in the portal's tables whose book the tools reach, removed afterwards."""
+    import asyncpg
+
+    token = f"wp_test_{uuid.uuid4().hex}"
+
+    async def make() -> tuple[str, str]:
+        conn = await asyncpg.connect(database_url)
+        wid = await conn.fetchval(
+            "insert into workshops (slug, title, join_code) values ($1, 'loan tool test', $2) returning id",
+            f"tool-test-{uuid.uuid4().hex[:8]}", uuid.uuid4().hex[:6].upper(),
+        )
+        aid = await conn.fetchval(
+            "insert into attendees (workshop_id, email, loan_service_token) values ($1, $2, $3) returning id", wid, DANA, token
+        )
+        await conn.close()
+        return str(wid), str(aid)
+
+    async def drop(wid: str, aid: str) -> None:
+        conn = await asyncpg.connect(database_url)
+        for table in ("loan_decisions", "loans", "loan_books"):
+            await conn.execute(f"delete from {table} where attendee_id = $1::uuid", aid)
+        await conn.execute("delete from workshops where id = $1::uuid", wid)
+        await conn.close()
+
+    wid, aid = asyncio.run(make())
+    yield {"token": token, "attendee_id": aid}
+    asyncio.run(drop(wid, aid))
 
 
 @pytest.fixture(scope="session")
-def idp_port() -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Userinfo)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield server.server_port
-    server.shutdown()
-
-
-@pytest.fixture(scope="session")
-def loan_app_host(idp_port: int) -> str:
-    bun = shutil.which("bun")
-    if bun is None:
-        pytest.skip("bun is not installed; the toolkit tests drive the real loan module")
-
-    tmp = Path(tempfile.mkdtemp(prefix="cg-loan-toolkit-"))
-    child, port = _boot_loan_app(bun, tmp, idp_port)
-
+def loan_app_host(database_url: str) -> str:
+    child, port = _boot_service(database_url)
     yield f"localhost:{port}"
-
     _stop(child)
-    shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _boot_loan_app(bun: str, tmp: Path, idp_port: int) -> tuple[subprocess.Popen, int]:
-    """Starts the loan module on a free port and waits for `/bank/health`.
-
-    In a session of its own, so `_stop` can take down its process group. A
-    child that lost its port says EADDRINUSE and exits (or keeps running,
-    listening nowhere); either way it is stopped and started again on a new
-    port, and a lost attempt leaves nothing running.
-    """
+def _boot_service(database_url: str) -> tuple[subprocess.Popen, int]:
+    """Starts the loan service on a free port and waits for `/bank/health`, retrying a lost port race."""
+    if not (SERVICE_DIR / "loan_service" / "main.py").is_file():
+        pytest.fail("Loan service source is missing. Set TEST_LOAN_SERVICE_DIR to workshop-portal/service (see mcp/LOANS.md).")
     for _ in range(_BOOT_ATTEMPTS):
         port = _free_port()
-        env = {
-            **os.environ,
-            "PORT": str(port),
-            "LOANS_DB_PATH": str(tmp / "loans.db"),
-            "IDP_ISSUER": f"http://127.0.0.1:{idp_port}/oauth2/default",
-        }
+        env = {**os.environ, "DATABASE_URL": database_url, "LOAN_SERVICE_ADMIN_TOKEN": "test"}
         child = subprocess.Popen(
-            [bun, str(LOAN_APP_ENTRYPOINT)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            ["uv", "run", "uvicorn", "loan_service.main:app", "--port", str(port), "--log-level", "warning"],
+            cwd=SERVICE_DIR, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
         )
         stderr = _drain(child.stderr)
         try:
@@ -171,7 +152,7 @@ def _boot_loan_app(bun: str, tmp: Path, idp_port: int) -> tuple[subprocess.Popen
             _stop(child)
             raise
         _stop(child)
-    raise RuntimeError(f"loan-app lost the port race {_BOOT_ATTEMPTS} times in a row")
+    raise RuntimeError(f"loan service lost the port race {_BOOT_ATTEMPTS} times in a row")
 
 
 def _wait_healthy(child: subprocess.Popen, port: int, stderr: list[str]) -> bool:
@@ -186,7 +167,7 @@ def _wait_healthy(child: subprocess.Popen, port: int, stderr: list[str]) -> bool
             output = "".join(stderr)
             if _lost_port_race(output):
                 return False
-            raise RuntimeError(f"loan-app exited: {output}")
+            raise RuntimeError(f"loan service exited: {output}")
         try:
             with urllib.request.urlopen(f"http://localhost:{port}/bank/health", timeout=1) as r:
                 if r.status == 200:
@@ -194,29 +175,32 @@ def _wait_healthy(child: subprocess.Popen, port: int, stderr: list[str]) -> bool
         except Exception:
             pass
         if time.time() > deadline:
-            raise RuntimeError(f"loan-app did not come up: {''.join(stderr)}")
+            raise RuntimeError(f"loan service did not come up: {''.join(stderr)}")
         time.sleep(0.05)
 
 
-def make_context(loan_app_host: str, token: str) -> ToolContext:
-    """What the Arcade engine hands a tool at runtime: a token and a secret."""
+def make_context(loan_app_host: str, book_token: str, actor: str | None) -> ToolContext:
+    """What the Arcade engine hands a tool at runtime: who the gateway signed in, and the two secrets."""
     return ToolContext(
-        authorization=ToolAuthorizationContext(token=token),
-        secrets=[ToolSecretItem(key=APP_HOST_SECRET, value=loan_app_host)],
-        user_id=TOKENS.get(token),
+        secrets=[
+            ToolSecretItem(key=APP_HOST_SECRET, value=loan_app_host),
+            ToolSecretItem(key=LOAN_BOOK_SECRET, value=book_token),
+        ],
+        user_id=actor,
     )
 
 
 @pytest.fixture
-def as_dana(loan_app_host: str) -> ToolContext:
-    return make_context(loan_app_host, "tok-dana")
+def as_dana(loan_app_host: str, loan_book: dict[str, str]) -> ToolContext:
+    return make_context(loan_app_host, loan_book["token"], DANA)
 
 
 @pytest.fixture
-def as_riley(loan_app_host: str) -> ToolContext:
-    return make_context(loan_app_host, "tok-riley")
+def as_riley(loan_app_host: str, loan_book: dict[str, str]) -> ToolContext:
+    return make_context(loan_app_host, loan_book["token"], RILEY)
 
 
 @pytest.fixture
-def as_nobody(loan_app_host: str) -> ToolContext:
-    return make_context(loan_app_host, "tok-forged")
+def as_nobody(loan_app_host: str, loan_book: dict[str, str]) -> ToolContext:
+    """A gateway that did not sign anyone in: no user id at all."""
+    return make_context(loan_app_host, loan_book["token"], None)

@@ -71,8 +71,8 @@ class ApprovalMessage:
 def build_fallback_text(message: ApprovalMessage) -> str:
     """The `text` field: notification previews and any client that cannot render blocks."""
     return (
-        f"{message.requester_display_name} is asking you to approve "
-        f"{message.action} on {message.resource_id} for "
+        f"{message.requester_display_name} is asking {message.approver_display_name} "
+        f"to approve {message.action} on {message.resource_id} for "
         f"{format_amount(message.amount)}."
     )
 
