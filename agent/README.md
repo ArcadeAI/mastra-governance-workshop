@@ -1,6 +1,6 @@
 # The agent
 
-A Mastra `Agent` whose tools are discovered from Arcade at runtime. It starts each run with `arcade_select_tools`. Each selection loads the signed-in user's Loan Desk tools from the project catalog, then adds Arcade's Tool Rec picks for the requested workflow, such as Slack or email. This matches the working LangChain workshop: recommendation ranking or indexing cannot crowd out the Loan Desk tools. Every tool call still runs through Arcade with the project key and the verified Okta email, so contextual access decides which calls are allowed and what fields return. No approval limit lives in the agent's prompt.
+A Mastra `Agent` whose tools are discovered from Arcade at runtime. It starts each run with `arcade_select_tools`. Each selection loads the signed-in user's Loan Desk tools from the project catalog, then adds Arcade's Tool Rec picks for the requested workflow, such as Slack or email. The catalog keeps recommendation ranking or indexing from crowding out the Loan Desk tools. Every tool call still runs through Arcade with the project key and the verified Okta email, so contextual access decides which calls are allowed and what fields return. No approval limit lives in the agent's prompt.
 
 You run it in Mastra Studio on your laptop. Every run is traced: locally, where Studio shows it, and on your Mastra platform project when `.env` names one.
 

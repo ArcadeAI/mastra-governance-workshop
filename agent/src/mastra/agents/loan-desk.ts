@@ -28,7 +28,7 @@ export const instructions = () => (arcade() ? INSTRUCTIONS : MODEL_ONLY);
 export function model() {
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set: put the key shared in the room in agent/.env");
-  // Accept the provider-qualified model value from the LangChain workshop too.
+  // Accept a provider-qualified model value too.
   const id = (process.env.MODEL_ID?.trim() || "claude-sonnet-5-5").replace(/^anthropic[:/]/, "");
   return { id: `anthropic/${id}` as const, apiKey };
 }
