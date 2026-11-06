@@ -80,6 +80,22 @@ async function loanDeskTools(c: Arcade, user: string): Promise<Suggestion[]> {
   return tools;
 }
 
+/** Tool Rec can serve a stale Slack schema without a version. Use the executable catalog entry instead. */
+async function currentSlackSend(c: Arcade, user: string): Promise<Suggestion | null> {
+  try {
+    for await (const item of c.tools.list({ toolkit: "Slack", user_id: user, limit: 100 })) {
+      const fqn = item.fully_qualified_name || item.qualified_name;
+      if (item.toolkit?.name !== "Slack" || typeof fqn !== "string") continue;
+      const [name, version] = fqn.split("@", 2);
+      if (name !== "Slack.SendMessage" || !version || !item.input?.parameters?.length) continue;
+      return { tool_name: name, version, toolkit: "Slack", description: item.description, input_schema: item.input.parameters };
+    }
+  } catch {
+    // An unverifiable recommendation must not be presented with a stale executable schema.
+  }
+  return null;
+}
+
 /** Always include this user's Loan Desk catalog, then add Tool Rec's picks for other workflows. */
 export async function select(tasks: string[], user: string, perTask = PER_TASK): Promise<{ queryId: string; tools: Suggestion[] }> {
   const c = arcade();
@@ -100,6 +116,11 @@ export async function select(tasks: string[], user: string, perTask = PER_TASK):
       const [name, version] = suggestion.tool_name.split("@", 2);
       if (!tools.has(name)) tools.set(name, { ...suggestion, tool_name: name, version: suggestion.version || version });
     }
+  }
+  if (tools.has("Slack.SendMessage")) {
+    const current = await currentSlackSend(c, user);
+    if (current) tools.set("Slack.SendMessage", current);
+    else tools.delete("Slack.SendMessage");
   }
   return { queryId: res.query_id ?? "", tools: [...tools.values()] };
 }

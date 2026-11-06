@@ -13,12 +13,14 @@ const approve = {
   toolkit: { name: "LoanDesk", version: "1.0.0" }, description: "Approve a business loan",
   input: { parameters: [{ name: "loan_id", required: true, value_schema: { val_type: "string" } }] },
 };
+let slackCatalog: unknown[];
 let catalog: unknown[], recommended: unknown[], catalogStatus: number, selectionStatus: number;
 let listedUsers: Array<string | null>;
 let executions: Array<Record<string, unknown>>;
 
 beforeEach(() => {
   catalog = [approve];
+  slackCatalog = [];
   recommended = [{ tool_name: "ZohoBooks.ApproveBill", input_schema: [] }];
   catalogStatus = 200;
   selectionStatus = 200;
@@ -29,8 +31,9 @@ beforeEach(() => {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
     if (url.pathname === "/v1/tools") {
       listedUsers.push(url.searchParams.get("user_id"));
+      const items = url.searchParams.get("toolkit") === "Slack" ? slackCatalog : catalog;
       return catalogStatus === 200
-        ? Response.json({ items: catalog, total_count: catalog.length, offset: 0 })
+        ? Response.json({ items, total_count: items.length, offset: 0 })
         : Response.json({ message: "catalog unavailable" }, { status: catalogStatus });
     }
     if (url.pathname === "/v1/tools/select") return selectionStatus === 200
@@ -71,6 +74,7 @@ test("an access-denied catalog contributes no tools", async () => {
 
 test("deduplicates versioned catalog and recommendation names while retaining other workflows", async () => {
   recommended = [{ tool_name: "LoanDesk.ApproveLoan", input_schema: [] }, { tool_name: "Slack.SendMessage", input_schema: [] }];
+  slackCatalog = [{ fully_qualified_name: "Slack.SendMessage@6.2.0", toolkit: { name: "Slack", version: "6.2.0" }, input: { parameters: [{ name: "messages", required: true, value_schema: { val_type: "array" } }] } }];
   const result = await select(["Approve the loan and tell the room"], officer);
   expect(result.tools.map((tool) => tool.tool_name)).toEqual(["LoanDesk.ApproveLoan", "Slack.SendMessage"]);
   expect(result.tools[0].input_schema).toEqual(approve.input.parameters);
@@ -90,4 +94,23 @@ test("catalog-discovered approvals still receive Arcade policy refusals as the s
   expect(result).toEqual({ error: "Above the officer clearance" });
   expect(executions).toHaveLength(1);
   expect(executions[0]).toMatchObject({ tool_name: "LoanDesk.ApproveLoan", user_id: officer, input: { loan_id: "LN-1291", amount: 95000 } });
+});
+
+
+test("Slack sends use the catalog's current version and batch schema, not a stale recommendation", async () => {
+  recommended = [{ tool_name: "Slack.SendMessage", input_schema: [{ name: "message", required: true }] }];
+  const parameters = [{ name: "messages", required: true, value_schema: { val_type: "array", inner_val_type: "json", inner_properties: { conversation: { val_type: "string" }, text: { val_type: "string" } }, inner_required_keys: ["conversation", "text"] } }];
+  slackCatalog = [{ fully_qualified_name: "Slack.SendMessage@6.2.0", toolkit: { name: "Slack", version: "6.2.0" }, input: { parameters } }];
+  const result = await select(["Post to Slack"], officer);
+  const slack = result.tools.find((tool) => tool.tool_name === "Slack.SendMessage")!;
+  expect(slack.version).toBe("6.2.0");
+  expect(slack.input_schema).toEqual(parameters);
+  await execute(slack, { messages: [{ conversation: "#workshop", text: "Hello" }] }, result.queryId, officer);
+  expect(executions[0]).toMatchObject({ tool_name: "Slack.SendMessage", tool_version: "6.2.0", input: { messages: [{ conversation: "#workshop", text: "Hello" }] } });
+});
+
+test("does not offer a stale Slack send when the current catalog entry is unavailable", async () => {
+  recommended = [{ tool_name: "Slack.SendMessage", input_schema: [{ name: "message" }] }];
+  const result = await select(["Post to Slack"], officer);
+  expect(result.tools.some((tool) => tool.tool_name === "Slack.SendMessage")).toBe(false);
 });
