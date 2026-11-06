@@ -16,6 +16,7 @@ const approve = {
 let catalog: unknown[], recommended: unknown[], catalogStatus: number, selectionStatus: number;
 let listedUsers: Array<string | null>;
 let executions: Array<Record<string, unknown>>;
+let definitions: Record<string, unknown>, lookups: string[];
 
 beforeEach(() => {
   catalog = [approve];
@@ -24,6 +25,8 @@ beforeEach(() => {
   selectionStatus = 200;
   listedUsers = [];
   executions = [];
+  definitions = {};
+  lookups = [];
   // Mock only HTTP: selection, SDK pagination and schema normalization remain real.
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -39,6 +42,11 @@ beforeEach(() => {
     if (url.pathname === "/v1/tools/execute") {
       executions.push(JSON.parse(String(init?.body)));
       return Response.json({ success: false, output: { error: { kind: "CONTEXT_DENIED", message: "Above the officer clearance" } } });
+    }
+    if (url.pathname.startsWith("/v1/tools/")) {
+      const name = decodeURIComponent(url.pathname.slice("/v1/tools/".length));
+      lookups.push(name);
+      return definitions[name] ? Response.json(definitions[name]) : Response.json({ message: "tool not found" }, { status: 404 });
     }
     throw new Error("Unexpected network request in the discovery test");
   }) as typeof fetch;
@@ -74,6 +82,29 @@ test("deduplicates versioned catalog and recommendation names while retaining ot
   const result = await select(["Approve the loan and tell the room"], officer);
   expect(result.tools.map((tool) => tool.tool_name)).toEqual(["LoanDesk.ApproveLoan", "Slack.SendMessage"]);
   expect(result.tools[0].input_schema).toEqual(approve.input.parameters);
+});
+
+test("a recommended tool gets the catalog's current schema and version, looked up once per process", async () => {
+  const stale = [{ name: "channel_name", value_schema: { val_type: "string" } }, { name: "message", required: true, value_schema: { val_type: "string" } }];
+  const live = [{ name: "messages", required: true, value_schema: { val_type: "array", inner_val_type: "json", inner_properties: { conversation: { val_type: "string" }, text: { val_type: "string" } }, inner_required_keys: ["conversation", "text"] } }];
+  recommended = [{ tool_name: "Slack.SendMessage", input_schema: stale }];
+  definitions["Slack.SendMessage"] = { name: "SendMessage", fully_qualified_name: "Slack.SendMessage@6.2.0", qualified_name: "Slack.SendMessage", toolkit: { name: "Slack", version: "6.2.0" }, input: { parameters: live } };
+  const first = await select(["Post a hello in #general"], officer);
+  const slack = first.tools.find((tool) => tool.tool_name === "Slack.SendMessage");
+  expect(slack?.input_schema).toEqual(live);
+  expect(slack?.version).toBe("6.2.0");
+  await select(["Post another hello in #general"], officer);
+  expect(lookups).toEqual(["Slack.SendMessage"]);
+});
+
+test("a recommended tool keeps Tool Rec's schema when the catalog lookup fails", async () => {
+  const fromToolRec = [{ name: "to", required: true, value_schema: { val_type: "string" } }];
+  recommended = [{ tool_name: "Gmail.SendEmail", input_schema: fromToolRec }];
+  const result = await select(["Email the borrower"], officer);
+  const gmail = result.tools.find((tool) => tool.tool_name === "Gmail.SendEmail");
+  expect(gmail?.input_schema).toEqual(fromToolRec);
+  expect(gmail?.version).toBeUndefined();
+  expect(lookups).toEqual(["Gmail.SendEmail"]);
 });
 
 test("does not include an unrelated toolkit from a misfiltered catalog response", async () => {

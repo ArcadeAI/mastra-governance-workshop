@@ -95,13 +95,40 @@ export async function select(tasks: string[], user: string, perTask = PER_TASK):
     if (pinned.length === 0) throw error;
   }
   const tools = new Map<string, Suggestion>(pinned.map((tool) => [tool.tool_name, tool]));
+  const picks: Suggestion[] = [];
   for (const result of res.results ?? []) {
     for (const suggestion of (result.suggestions ?? []).slice(0, perTask)) {
       const [name, version] = suggestion.tool_name.split("@", 2);
-      if (!tools.has(name)) tools.set(name, { ...suggestion, tool_name: name, version: suggestion.version || version });
+      if (tools.has(name)) continue;
+      const pick = { ...suggestion, tool_name: name, version: suggestion.version || version };
+      tools.set(name, pick);
+      picks.push(pick);
     }
   }
+  await Promise.all(picks.map(async (pick) => Object.assign(pick, await current(c, pick.tool_name, user))));
   return { queryId: res.query_id ?? "", tools: [...tools.values()] };
+}
+
+/** The catalog's schema and version per tool name, kept for the process. Failed lookups are not kept. */
+const definitions = new Map<string, Promise<Pick<Suggestion, "input_schema" | "version"> | null>>();
+
+/**
+ * Tool Rec can hand out a schema older than the tool it runs (Slack.SendMessage's `channel_name`
+ * and `message` after 6.x moved to a `messages` list), so the model builds calls the tool rejects.
+ * The catalog's definition wins, with its version so the call runs the schema the model saw; when
+ * the lookup fails, Tool Rec's suggestion stands.
+ */
+function current(c: Arcade, name: string, user: string) {
+  let found = definitions.get(name);
+  if (!found) {
+    found = c.tools.get(name, { user_id: user }).then(
+      (t) => Array.isArray(t.input?.parameters) ? { input_schema: t.input.parameters, version: t.fully_qualified_name?.split("@", 2)[1] || t.toolkit?.version || undefined } : null,
+      () => null,
+    );
+    definitions.set(name, found);
+    found.then((d) => d || definitions.delete(name));
+  }
+  return found.then((d) => d ?? {});
 }
 
 /** Runs one tool through the engine, as `user_id`. Never throws: a refusal, an error or a sign-in link is an answer the model can read. */
